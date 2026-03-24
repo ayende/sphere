@@ -14,20 +14,15 @@ async Task Main(string[] args)
 {
     if (args.Length < 3)
     {
-        Console.WriteLine("Usage: dotnet run -- <raven-url> <database> <jsonl-path>");
+        Console.WriteLine("Usage: dotnet run -- <raven-url> <database> <jsonl-path-or-url>");
         Console.WriteLine("Example: dotnet run -- http://localhost:8080 Sphere sphere.100k.jsonl");
+        Console.WriteLine("Example: dotnet run -- http://localhost:8080 Sphere https://example.com/sphere.jsonl");
         return;
     }
 
     var ravenUrl = args[0];
     var database = args[1];
     var jsonlPath = args[2];
-
-    if (!File.Exists(jsonlPath))
-    {
-        Console.Error.WriteLine($"JSONL file not found: {jsonlPath}");
-        return;
-    }
 
     using var store = new DocumentStore
     {
@@ -89,22 +84,37 @@ async Task Main(string[] args)
 
     async Task<Stream> GetSourceStream(string path)
     {
-        if (path.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+        if (Uri.TryCreate(path, UriKind.Absolute, out var uri) &&
+            (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
         {
-            var gzipStream = new GZipStream(File.OpenRead(path), CompressionMode.Decompress);
-            var tarReader = new TarReader(gzipStream);
-            var entry = await tarReader.GetNextEntryAsync(copyData: false);
-
-            if (entry?.DataStream is null)
-            {
-                throw new InvalidOperationException("No valid file found in tar.gz archive");
-            }
-
-            Console.WriteLine($"Reading from tar entry: {entry.Name}");
-            return entry.DataStream;
+            Console.WriteLine($"Streaming from URL: {path}");
+            var httpClient = new HttpClient();
+            httpClient.Timeout = TimeSpan.FromHours(96); // Set a long timeout for large files
+            var response = await httpClient.GetAsync(path, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            return await GetInnerStream(path, await response.Content.ReadAsStreamAsync());
         }
 
-        return File.OpenRead(path);
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"JSONL file not found: {path}");
+
+        return await GetInnerStream(path, File.OpenRead(path));
+    }
+
+    async Task<Stream> GetInnerStream(string path, Stream stream)
+    {
+        if (!path.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+            return stream;
+
+        var gzipStream = new GZipStream(stream, CompressionMode.Decompress);
+        var tarReader = new TarReader(gzipStream);
+        var entry = await tarReader.GetNextEntryAsync(copyData: false);
+
+        if (entry?.DataStream is null)
+            throw new InvalidOperationException("No valid file found in tar.gz archive");
+
+        Console.WriteLine($"Reading from tar entry: {entry.Name}");
+        return entry.DataStream;
     }
 }
 
